@@ -1,2 +1,3 @@
-# whispertestare
-whisper
+# Whisper
+
+Military Grade Encrypted Messaging.
