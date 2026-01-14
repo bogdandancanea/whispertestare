@@ -20,6 +20,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <head>
+        <link rel="icon" href="/favicon.ico" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link
@@ -32,7 +33,7 @@ export default function RootLayout({
         <LayoutWrapper>
           <div
             className={cn(
-              "relative z-10 mx-auto min-h-screen max-w-xl px-6 pb-16 pt-10 sm:px-4"
+              "relative z-10 mx-auto flex min-h-[100svh] max-w-xl flex-col px-6 pb-16 pt-10 sm:px-4"
             )}
           >
             {children}

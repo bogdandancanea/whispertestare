@@ -14,14 +14,16 @@ import {
   deleteWhisper,
   checkWhisperExists,
   generateNewId,
+  markAsRead,
   CardState,
+  WhisperData,
 } from '@/lib/actions';
 import { db } from '@/lib/firebase';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { encrypt as encryptMessage, decrypt as decryptMessage } from '@/lib/crypto';
 import { useToast } from '@/hooks/use-toast';
 import {
-    BanIcon, CheckIcon, CopyIcon, FlameIcon, HashIcon, KeyIcon, LockIcon, MessageIcon, ServerIcon, ShieldCheckIcon, UnlockedIcon
+    BanIcon, CopyIcon, FlameIcon, HashIcon, KeyIcon, LockIcon, MessageIcon, ServerIcon, ShieldCheckIcon
 } from './icons';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -29,14 +31,22 @@ import { Textarea } from '@/components/ui/textarea';
 
 type Mode = 'send' | 'read';
 type View = 'form' | 'send-result' | 'read-result' | 'exhausted';
-type LiveStatus = 'waiting' | 'read' | 'expired' | null;
+type LiveStatus = 'waiting' | 'read' | 'expired' | 'countdown' | null;
 
-const liveSequenceSteps = [
-  "Connection established...",
-  "Authenticating reader...",
-  "Passphrase validated...",
-  "Message unlocked.",
-  "Whisper destroyed."
+const destructionSequenceSender = [
+  "CONFIRMED: Recipient has viewed the whisper.",
+  "Initiating burn sequence...",
+  "Revoking encryption keys.",
+  "Neutralizing all server traces.",
+  "COMPLETE: No evidence remains.",
+];
+
+const destructionSequenceReader = [
+  "Passphrase accepted. Decrypting payload...",
+  "Whisper unlocked. Integrity check: PASSED.",
+  "This message will self-destruct after viewing.",
+  "Arming burn sequence...",
+  "DESTROYED: Silence restored.",
 ];
 
 
@@ -52,6 +62,8 @@ const readSchema = z.object({
 });
 type ReadFormData = z.infer<typeof readSchema>;
 
+const COUNTDOWN_DURATION = 45;
+
 export default function WhisperApp({ cardId, initialState }: { cardId: string, initialState: CardState }) {
   const [mode, setMode] = useState<Mode>('send');
   const [view, setView] = useState<View>('form');
@@ -62,16 +74,73 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
   const [copyButtonText, setCopyButtonText] = useState('Copy ID');
   const [liveStatus, setLiveStatus] = useState<LiveStatus>(null);
   const [sequenceIndex, setSequenceIndex] = useState(0);
+  const [isBurnTriggered, setIsBurnTriggered] = useState(false);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [timerColor, setTimerColor] = useState('text-foreground');
+
 
   const { toast } = useToast();
   const unsubscribeRef = useRef<() => void | undefined>();
-
-  const sendForm = useForm<SendFormData>({ resolver: zodResolver(sendSchema), defaultValues: { passphrase: '', message: '' } });
-  const readForm = useForm<ReadFormData>({ resolver: zodResolver(readSchema), defaultValues: { id: '', passphrase: '' } });
-
-  const isDestructionSequenceFinished = useMemo(() => (liveStatus === 'read' || liveStatus === 'expired') && sequenceIndex === liveSequenceSteps.length - 1, [liveStatus, sequenceIndex]);
+  const countdownIntervalRef = useRef<NodeJS.Timeout | undefined>();
+  const liveStatusRef = useRef(liveStatus);
+  
+  const sendForm = useForm<SendFormData>({ resolver: zodResolver(sendSchema), mode: 'onChange', defaultValues: { passphrase: '', message: '' } });
+  const readForm = useForm<ReadFormData>({ resolver: zodResolver(readSchema), mode: 'onChange', defaultValues: { id: '', passphrase: '' } });
 
   const isCardExhausted = useMemo(() => cardState.sends <= 0 && cardState.reads <= 0, [cardState]);
+
+  const handleCreateAnother = useCallback(() => {
+    sendForm.reset();
+    if (isCardExhausted) {
+        setView('exhausted');
+    } else {
+        setView('form');
+        setMode('send');
+    }
+    if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = undefined;
+    }
+    setLiveStatus(null);
+    setSequenceIndex(0);
+    setCountdown(null);
+    setIsBurnTriggered(false);
+    setResultId('');
+    setResultMessage('');
+  }, [isCardExhausted, sendForm]);
+  
+  const handleReadAnother = useCallback(() => {
+    readForm.reset();
+    if (isCardExhausted) {
+        setView('exhausted');
+    } else {
+        setView('form');
+        setMode('read');
+    }
+    setSequenceIndex(0);
+    setLiveStatus(null);
+    setIsBurnTriggered(false);
+    setCountdown(null);
+    setResultId('');
+    setResultMessage('');
+  }, [isCardExhausted, readForm]);
+
+  const handleModeChange = (newMode: Mode) => {
+    if (isLoading) return;
+    setMode(newMode);
+  };
+  
+  const isDestructionActive = useMemo(() => {
+    if (view === 'send-result' && liveStatus === 'read') return true;
+    if (view === 'read-result' && isBurnTriggered) return true;
+    return false;
+  }, [view, liveStatus, isBurnTriggered]);
+
+  const destructionSequence = useMemo(() => {
+    if (view === 'read-result') return destructionSequenceReader;
+    if (view === 'send-result') return destructionSequenceSender;
+    return [];
+  }, [view]);
 
   useEffect(() => {
     setCardState(initialState);
@@ -87,50 +156,117 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
       if (unsubscribeRef.current) {
         unsubscribeRef.current();
       }
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+      }
     };
   }, []);
   
   useEffect(() => {
+    liveStatusRef.current = liveStatus;
+  }, [liveStatus]);
+
+  useEffect(() => {
     if (view === 'send-result' && resultId) {
-      setLiveStatus('waiting');
       const docRef = doc(db, 'whispers', resultId);
       unsubscribeRef.current = onSnapshot(docRef, (snap) => {
-        if (!snap.exists()) {
-          setLiveStatus(prev => prev === 'waiting' ? 'read' : prev);
+        if (snap.exists()) {
+            const data = snap.data() as WhisperData;
+            if (data.status === 'read' && data.readAt && liveStatusRef.current !== 'countdown') {
+                setLiveStatus('countdown');
+                const readTime = data.readAt.seconds * 1000;
+                const now = Date.now();
+                const elapsed = Math.floor((now - readTime) / 1000);
+                const remaining = Math.max(0, COUNTDOWN_DURATION - elapsed);
+                setCountdown(remaining);
+            }
+        } else {
+            if(liveStatusRef.current !== 'read') {
+                setLiveStatus('read');
+            }
         }
       });
-    } else {
-      if (unsubscribeRef.current) {
-        unsubscribeRef.current();
-        unsubscribeRef.current = undefined;
-      }
+    }
+    
+    return () => {
+        if (unsubscribeRef.current) {
+            unsubscribeRef.current();
+            unsubscribeRef.current = undefined;
+        }
     }
   }, [view, resultId]);
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (liveStatus === 'read' || liveStatus === 'expired') {
-      interval = setInterval(() => {
-        setSequenceIndex(prev => {
-          if (prev < liveSequenceSteps.length - 1) {
-            return prev + 1;
-          }
-          clearInterval(interval);
-          return prev;
-        });
-      }, 700);
+    if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
     }
-    return () => clearInterval(interval);
-  }, [liveStatus]);
+  
+    if (countdown !== null && countdown > 0) {
+      countdownIntervalRef.current = setInterval(() => {
+        setCountdown(prev => {
+          if (prev === null || prev <= 1) {
+            clearInterval(countdownIntervalRef.current!);
+             if (view === 'read-result') {
+                 setIsBurnTriggered(true);
+             }
+            return 0;
+          }
+          const next = prev - 1;
+          if (next <= 10) {
+            setTimerColor('text-accent-red');
+          } else if (next <= 30) {
+            setTimerColor('text-accent-orange');
+          } else {
+            setTimerColor('text-foreground');
+          }
+          return next;
+        });
+      }, 1000);
+    } else if (countdown === 0) {
+       if (view === 'read-result') {
+           setIsBurnTriggered(true);
+       }
+    }
+  
+    return () => {
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+      }
+    };
+  }, [countdown, view]);
 
 
-  const handleModeChange = (newMode: Mode) => {
-    if (isLoading) return;
-    setMode(newMode);
-    setView('form');
-    sendForm.reset();
-    readForm.reset();
-  };
+  useEffect(() => {
+    let interval: NodeJS.Timeout | undefined;
+    if (isDestructionActive) {
+      setSequenceIndex(0);
+      let currentStep = 0;
+      
+      if (view === 'read-result' && resultId) {
+          deleteWhisper(resultId);
+      }
+
+      interval = setInterval(() => {
+        setSequenceIndex(currentStep);
+        currentStep++;
+
+        if (currentStep >= destructionSequence.length) {
+          clearInterval(interval!);
+          setTimeout(() => {
+            if (view === 'read-result') {
+                 handleReadAnother();
+            } else if (view === 'send-result') {
+                 handleCreateAnother();
+            }
+          }, 2000);
+        }
+      }, 1200);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isDestructionActive, destructionSequence, view, handleCreateAnother, handleReadAnother, resultId]);
+
 
   const onSendSubmit: SubmitHandler<SendFormData> = async (data) => {
     if (cardState.sends <= 0) {
@@ -139,14 +275,12 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
     }
     setIsLoading(true);
     try {
-      // Use card first via transaction
       const newState = await useCard(cardId, 'send');
       if ('error' in newState) {
           throw new Error(newState.error);
       }
       setCardState(newState);
 
-      // If transaction is successful, proceed to create whisper
       const encryptedData = await encryptMessage(data.message, data.passphrase);
       
       let newId = await generateNewId();
@@ -163,13 +297,17 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
       await saveWhisper(newId, encryptedData);
 
       setResultId(newId);
+      
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      
       setView('send-result');
 
     } catch (error) {
       toast({ variant: 'destructive', title: 'Operation Failed', description: error instanceof Error ? error.message : 'Could not complete the send operation.' });
-      // Re-fetch state to ensure consistency if something failed after transaction
       const currentState = await getCardState(cardId);
-      setCardState(currentState);
+      if(!('error' in currentState)) {
+        setCardState(currentState)
+      };
     } finally {
       setIsLoading(false);
     }
@@ -197,23 +335,30 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
 
         const message = await decryptMessage(whisper.ct, whisper.salt, whisper.iv, data.passphrase);
         
-        // Decryption successful, now use the card
         const newState = await useCard(cardId, 'read');
         if ('error' in newState) {
             throw new Error(newState.error);
         }
         setCardState(newState);
-
-        await deleteWhisper(data.id);
+        
+        await markAsRead(data.id);
         
         setResultMessage(message);
+        setResultId(data.id);
+        setCountdown(COUNTDOWN_DURATION);
+        setTimerColor('text-foreground');
+        setLiveStatus('countdown');
+
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+
         setView('read-result');
 
     } catch (error) {
-        toast({ variant: 'destructive', title: 'Decryption Failed', description: error instanceof Error && error.message.includes('No reads remaining') ? error.message : 'Wrong passphrase or message is corrupted.' });
-        // Re-fetch state to ensure consistency
+        toast({ variant: 'destructive', title: 'Decryption Failed', description: error instanceof Error && error.message.includes('No reads remaining') ? error.message : 'Could not decrypt whisper.' });
         const currentState = await getCardState(cardId);
-        setCardState(currentState);
+        if(!('error' in currentState)) {
+            setCardState(currentState);
+        }
     } finally {
         setIsLoading(false);
     }
@@ -225,68 +370,39 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
     setTimeout(() => setCopyButtonText('Copy ID'), 2000);
   };
   
-  const handleCreateAnother = () => {
-    sendForm.reset();
-    if(isCardExhausted) {
-        setView('exhausted');
-    } else {
-        setView('form');
+  const renderHeaderContent = () => {
+    if (isDestructionActive) {
+      return (
+        <div className="flex min-h-[4rem] items-center justify-center">
+            <div className="flex items-center gap-3 font-mono text-base tracking-wide text-primary">
+                {sequenceIndex < destructionSequence.length - 1 ? (
+                    <div className="relative z-10 h-4 w-4 flex-shrink-0 animate-spin-fast rounded-full border-2 border-primary/40 border-t-primary" />
+                ) : (
+                    <FlameIcon className="h-4 w-4 flex-shrink-0 text-destructive" />
+                )}
+                <span className={cn(sequenceIndex >= destructionSequence.length - 1 && 'text-destructive')}>{destructionSequence[sequenceIndex]}</span>
+            </div>
+        </div>
+      );
     }
-    setMode('send');
-    if (unsubscribeRef.current) {
-        unsubscribeRef.current();
-        unsubscribeRef.current = undefined;
-    }
-    setLiveStatus(null);
-    setSequenceIndex(0);
-  };
-  
-  const handleReadAnother = () => {
-    readForm.reset();
-    if(isCardExhausted) {
-        setView('exhausted');
-    } else {
-        setView('form');
-    }
-    setMode('read');
-  };
-  
-  const renderLiveStatus = () => {
-    if (liveStatus === null) return null;
-
-    if (liveStatus === 'waiting') {
-        return (
-            <div className="flex flex-col items-center gap-4 rounded-2xl border border-primary/20 bg-card/90 p-5 text-center shadow-[0_4px_24px_rgba(0,0,0,0.2)] backdrop-blur-xl">
-                <div className="relative flex h-10 w-10 items-center justify-center">
-                    <div className="absolute h-full w-full animate-pulse rounded-full bg-primary/70 opacity-50"></div>
-                    <ShieldCheckIcon className="relative z-10 h-6 w-6 text-primary" />
-                </div>
-                <div>
-                    <p className="font-semibold text-foreground">Awaiting Engagement</p>
-                    <p className="text-sm text-muted-foreground">Encrypted & Secured</p>
+    if (liveStatus === 'countdown' && countdown !== null) {
+         return (
+            <div className="flex min-h-[4rem] items-center justify-center">
+                <div className={cn("font-mono text-2xl font-semibold tracking-wider", timerColor)}>
+                    {String(Math.floor(countdown / 60)).padStart(2, '0')}:{String(countdown % 60).padStart(2, '0')}
                 </div>
             </div>
         );
     }
-    
-    const isFinished = sequenceIndex === liveSequenceSteps.length - 1;
     return (
-       <div className="flex flex-col items-center gap-3 rounded-2xl border border-destructive/20 bg-card/90 p-5 text-center shadow-[0_4px_24px_rgba(0,0,0,0.2)] backdrop-blur-xl">
-            <div className="relative flex h-10 w-10 items-center justify-center">
-                {isFinished ? (
-                  <FlameIcon className="h-6 w-6 text-destructive" />
-                ) : (
-                  <div className="relative z-10 h-5 w-5 animate-spin-fast rounded-full border-2 border-primary/40 border-t-primary" />
-                )}
-            </div>
-            <div>
-                <p className={cn("font-mono text-sm tracking-wide", isFinished ? 'text-destructive' : 'text-primary')}>
-                  {liveSequenceSteps[sequenceIndex]}
-                </p>
-            </div>
+        <div className="flex min-h-[4rem] items-center justify-center">
+            <p className="text-base leading-relaxed text-foreground/75">
+              End-to-end encrypted messages<br />that self-destruct after reading
+            </p>
         </div>
     );
-  }
+  };
+
 
   const renderForm = () => (
     <div className={cn('relative rounded-3xl border border-[hsl(var(--border))] bg-card/80 p-7 shadow-[0_20px_60px_rgba(0,0,0,0.4)] backdrop-blur-xl before:absolute before:left-0 before:top-0 before:h-px before:w-full before:bg-gradient-to-r before:from-transparent before:via-[hsl(var(--primary)/0.3)] before:to-transparent', { 'hidden': view !== 'form' })}>
@@ -294,12 +410,12 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
       <form onSubmit={sendForm.handleSubmit(onSendSubmit)} className={cn({ 'hidden': mode !== 'send' })}>
         <div className="mb-6 space-y-3">
           <label className="flex items-center gap-2 text-sm font-semibold text-foreground/75"><KeyIcon className="h-4 w-4 text-primary" />Secret Passphrase</label>
-          <Input type="password" placeholder="Create a strong passphrase" {...sendForm.register('passphrase')} className="h-14 rounded-xl border-[hsl(var(--primary)/0.25)] bg-input p-5 text-base placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" />
+          <Input type="password" placeholder="Create a strong passphrase" {...sendForm.register('passphrase')} className="h-14 rounded-xl border-[hsl(var(--primary)/0.25)] bg-card/80 p-5 text-base placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" />
           {sendForm.formState.errors.passphrase && <p className="text-sm text-destructive">{sendForm.formState.errors.passphrase.message}</p>}
         </div>
         <div className="mb-6 space-y-3">
           <label className="flex items-center gap-2 text-sm font-semibold text-foreground/75"><MessageIcon className="h-4 w-4 text-primary" />Your Secret Message</label>
-          <Textarea placeholder="Type your confidential message..." {...sendForm.register('message')} className="min-h-[140px] rounded-xl border-[hsl(var(--primary)/0.25)] bg-input p-5 text-base placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" />
+          <Textarea placeholder="Type your confidential message..." {...sendForm.register('message')} className="min-h-[140px] rounded-xl border-[hsl(var(--primary)/0.25)] bg-card/80 p-5 text-base placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" />
           {sendForm.formState.errors.message && <p className="text-sm text-destructive">{sendForm.formState.errors.message.message}</p>}
         </div>
         <Button type="submit" disabled={isLoading || cardState.sends <= 0} className="group relative h-16 w-full overflow-hidden rounded-2xl bg-gradient-to-br from-primary to-[#c9a227] text-lg font-bold text-primary-foreground shadow-[0_4px_20px_hsl(var(--primary)/0.4)] transition-all hover:translate-y-[-3px] hover:shadow-[0_8px_30px_hsl(var(--primary)/0.5)] active:translate-y-0 disabled:opacity-40 disabled:transform-none disabled:shadow-none">
@@ -321,13 +437,13 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
                   e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
                   readForm.setValue('id', e.target.value);
               }}
-              className="h-20 rounded-xl border-[hsl(var(--primary)/0.25)] bg-input p-5 text-center font-code text-4xl font-semibold tracking-[6px] placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" 
+              className="h-20 rounded-xl border-[hsl(var(--primary)/0.25)] bg-card/80 p-5 text-center font-code text-4xl font-semibold tracking-[6px] placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" 
           />
            {readForm.formState.errors.id && <p className="text-sm text-destructive">{readForm.formState.errors.id.message}</p>}
         </div>
         <div className="mb-6 space-y-3">
           <label className="flex items-center gap-2 text-sm font-semibold text-foreground/75"><KeyIcon className="h-4 w-4 text-primary" />Secret Passphrase</label>
-          <Input type="password" placeholder="Enter the passphrase" {...readForm.register('passphrase')} className="h-14 rounded-xl border-[hsl(var(--primary)/0.25)] bg-input p-5 text-base placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" />
+          <Input type="password" placeholder="Enter the passphrase" {...readForm.register('passphrase')} className="h-14 rounded-xl border-[hsl(var(--primary)/0.25)] bg-card/80 p-5 text-base placeholder:text-muted-foreground focus:border-primary focus:shadow-[0_0_0_4px_hsl(var(--primary)/0.15),0_0_30px_hsl(var(--primary)/0.1)]" />
            {readForm.formState.errors.passphrase && <p className="text-sm text-destructive">{readForm.formState.errors.passphrase.message}</p>}
         </div>
         <Button type="submit" disabled={isLoading || cardState.reads <= 0} className="group relative h-16 w-full overflow-hidden rounded-2xl bg-gradient-to-br from-primary to-[#c9a227] text-lg font-bold text-primary-foreground shadow-[0_4px_20px_hsl(var(--primary)/0.4)] transition-all hover:translate-y-[-3px] hover:shadow-[0_8px_30px_hsl(var(--primary)/0.5)] active:translate-y-0 disabled:opacity-40 disabled:transform-none disabled:shadow-none">
@@ -340,11 +456,7 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
 
   const renderSendResult = () => (
     <div className={cn("text-center", { 'hidden': view !== 'send-result' })}>
-      <div className="mx-auto mb-6 flex h-[72px] w-[72px] items-center justify-center rounded-full bg-gradient-to-br from-green-500 to-green-700 shadow-[0_8px_30px_rgba(0,230,118,0.4)]"><CheckIcon className="h-9 w-9 text-white" /></div>
-      <h2 className="text-3xl font-bold">Whisper Secured</h2>
-      <p className="mb-8 text-base text-foreground/75">Share the ID and passphrase separately. This whisper will self-destruct.</p>
-
-      <div className="relative mb-6 rounded-2xl border border-[hsl(var(--border))] bg-card/90 p-7 backdrop-blur-xl before:absolute before:left-0 before:top-0 before:h-px before:w-full before:bg-gradient-to-r before:from-transparent before:via-[hsl(var(--primary)/0.4)] before:to-transparent">
+      <div className="relative my-8 rounded-2xl border border-[hsl(var(--border))] bg-card/90 p-7 backdrop-blur-xl before:absolute before:left-0 before:top-0 before:h-px before:w-full before:bg-gradient-to-r before:from-transparent before:via-[hsl(var(--primary)/0.4)] before:to-transparent">
           <div className="mb-4 text-xs font-bold uppercase tracking-[2px] text-primary">Your Whisper ID</div>
           <div className="mb-5 font-code text-5xl font-bold tracking-[8px] text-foreground">{resultId}</div>
           <Button variant="ghost" onClick={handleCopyId} className="h-auto rounded-full border border-border bg-input px-7 py-3.5 text-sm font-semibold text-foreground/75 hover:border-primary hover:bg-card hover:text-primary hover:shadow-[0_0_20px_hsl(var(--primary)/0.2)]">
@@ -353,41 +465,33 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
           </Button>
       </div>
 
-      <div className="mb-6 space-y-3">
-        {renderLiveStatus()}
-      </div>
-
-      {(isDestructionSequenceFinished || isCardExhausted) && (
-        <Button onClick={handleCreateAnother} variant="outline" className="h-14 w-full rounded-xl border-border bg-transparent text-base font-semibold hover:bg-card/90">Create Another Whisper</Button>
-      )}
+      <Button onClick={handleCreateAnother} variant="outline" className="h-14 w-full rounded-xl border-border bg-transparent text-base font-semibold hover:bg-card/90">Create Another Whisper</Button>
     </div>
   );
 
   const renderReadResult = () => (
     <div className={cn("text-center", { 'hidden': view !== 'read-result' })}>
-      <div className="mx-auto mb-6 flex h-[72px] w-[72px] items-center justify-center rounded-full bg-gradient-to-br from-green-500 to-green-700 shadow-[0_8px_30px_rgba(0,230,118,0.4)]"><UnlockedIcon className="h-9 w-9 text-white" /></div>
-      <h2 className="text-3xl font-bold">Message Unlocked</h2>
-      <p className="mb-8 text-base text-foreground/75">This whisper has been permanently destroyed</p>
-      
-      <div className="mb-6 rounded-2xl border border-[hsl(var(--border))] bg-card/90 p-6 text-left">
-          <div className="mb-4 text-xs font-bold uppercase tracking-[2px] text-primary">Decrypted Message</div>
-          <p className="whitespace-pre-wrap break-words text-lg leading-relaxed text-foreground">{resultMessage}</p>
-      </div>
+        <div className="my-8 rounded-2xl border border-[hsl(var(--border))] bg-card/90 p-6 text-left">
+            <p className="whitespace-pre-wrap break-words text-lg leading-relaxed text-foreground">{resultMessage}</p>
+        </div>
 
-       <div className="mb-6 flex items-start gap-3.5 rounded-2xl border border-amber-500/20 bg-amber-950/50 p-5 text-amber-400">
-        <FlameIcon className="h-10 w-10 flex-shrink-0 sm:h-6 sm:w-6" />
-        <p className="text-left text-sm leading-relaxed">This whisper has been <strong>burned</strong> and cannot be accessed again. The encrypted data has been permanently deleted from our servers.</p>
-      </div>
-
-      <Button onClick={handleReadAnother} variant="outline" className="h-14 w-full rounded-xl border-border bg-transparent text-base font-semibold hover:bg-card/90">Read Another Whisper</Button>
+        <Button onClick={handleReadAnother} variant="outline" className="h-14 w-full rounded-xl border-border bg-transparent text-base font-semibold hover:bg-card/90">Read Another Whisper</Button>
     </div>
-  );
+);
 
   const renderExhausted = () => (
-    <div className={cn("py-16 text-center", { 'hidden': view !== 'exhausted' })}>
+    <div className={cn("py-10 text-center", { 'hidden': view !== 'exhausted' })}>
       <div className="mx-auto mb-8 flex h-24 w-24 items-center justify-center rounded-full border border-border bg-card/80"><BanIcon className="h-12 w-12 text-muted-foreground" /></div>
       <h2 className="text-3xl font-bold">Card Exhausted</h2>
-      <p className="mx-auto mt-4 max-w-xs text-base leading-relaxed text-foreground/75">This card has no remaining sends or reads. Please use a different card.</p>
+      <p className="mx-auto mt-4 max-w-xs text-base leading-relaxed text-foreground/75">
+        This card has no remaining credits.
+      </p>
+       <div className="group relative mt-8 mx-auto w-full max-w-xs">
+            <button className="group relative h-16 w-full overflow-hidden rounded-2xl bg-gradient-to-br from-primary to-[#c9a227] text-lg font-bold text-primary-foreground shadow-[0_4px_20px_hsl(var(--primary)/0.4)] transition-all hover:translate-y-[-3px] hover:shadow-[0_8px_30px_hsl(var(--primary)/0.5)] active:translate-y-0 disabled:opacity-40 disabled:transform-none disabled:shadow-none">
+                Tap to Add Credits
+                <span className="absolute left-[-100%] top-0 h-full w-full bg-gradient-to-r from-transparent via-white/30 to-transparent transition-all duration-700 group-hover:left-full" />
+            </button>
+        </div>
     </div>
   );
 
@@ -397,14 +501,12 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
       <header className="animate-slide-up text-center">
         <div className="mx-auto mb-6 inline-flex animate-border-glow items-center gap-2 rounded-full border border-[hsl(var(--primary)/0.25)] bg-gradient-to-br from-[hsl(var(--primary)/0.15)] to-[hsl(var(--primary)/0.05)] px-4 py-2 backdrop-blur-sm">
           <span className="h-2 w-2 animate-pulse rounded-full bg-primary shadow-[0_0_10px_hsl(var(--primary))]"></span>
-          <span className="text-xs font-semibold uppercase tracking-[2px] text-primary">Military Grade Encryption</span>
+          <span className="text-xs font-semibold uppercase tracking-[2px] text-primary">Military-Grade Encryption</span>
         </div>
         <h1 className="logo animate-shimmer mb-3 bg-gradient-to-r from-white via-primary to-white bg-200% bg-clip-text text-5xl font-extrabold tracking-tight text-transparent sm:text-6xl" style={{textShadow: '0 0 80px hsl(var(--primary)/0.3)'}}>
           Whisper
         </h1>
-        <p className="text-base leading-relaxed text-foreground/75">
-          End-to-end encrypted messages<br />that self-destruct after reading
-        </p>
+        {renderHeaderContent()}
       </header>
       
       <main>
@@ -445,13 +547,13 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
                   <span className="text-xs font-bold uppercase tracking-widest text-green-400">Verified Secure</span>
                 </div>
                 <h3 className="mb-3 text-2xl font-bold sm:text-3xl">Military-Grade Encryption</h3>
-                <p className="mx-auto max-w-md text-base leading-relaxed text-foreground/75">Your messages are protected with security standards used by government agencies.</p>
+                <p className="mx-auto max-w-md text-base leading-relaxed text-foreground/75">Proprietary encryption protocols ensure your communications remain beyond the reach of any third party.</p>
               </div>
               <div className="space-y-4">
                   {[
                       { icon: LockIcon, title: 'Unbreakable Algorithm', text: 'AES-256-GCM encryption — the gold standard for top-secret information worldwide.' },
                       { icon: KeyIcon, title: 'Fortified Key Derivation', text: 'PBKDF2 with 310,000 iterations transforms your passphrase into a quantum-resistant key.' },
-                      { icon: ServerIcon, title: 'Zero-Knowledge Architecture', text: 'All encryption happens in your browser. We never see your messages, ever.' },
+                      { icon: ServerIcon, title: 'Ghost Protocol Architecture', text: 'All encryption happens in your browser. We never see your messages, ever.' },
                   ].map((item, i) => (
                       <div key={i} className="flex items-start gap-4 rounded-2xl border border-[hsl(var(--border))] bg-card/80 p-5 transition-all duration-300 hover:-translate-y-1 hover:border-border hover:shadow-[0_15px_40px_rgba(0,0,0,0.2)]">
                           <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-[hsl(var(--primary)/0.2)] to-[hsl(var(--primary)/0.05)] shadow-[0_0_20px_hsl(var(--primary)/0.1)]">
@@ -468,8 +570,16 @@ export default function WhisperApp({ cardId, initialState }: { cardId: string, i
       </main>
 
       <footer className="mt-auto pt-10 text-center">
-        <p className="text-xs text-muted-foreground">Your messages never leave your device unencrypted.</p>
+        <p className="text-xs tracking-widest text-muted-foreground/50">
+          © {new Date().getFullYear()} WHISPER INC. ALL RIGHTS RESERVED.
+        </p>
+        <p className="mt-1 text-xs tracking-widest text-muted-foreground/30">
+          A DIVISION OF THE SILENTIUM PROTOCOL
+        </p>
       </footer>
     </div>
   );
 }
+
+    
+

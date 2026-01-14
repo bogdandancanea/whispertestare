@@ -3,6 +3,7 @@
 
 import { useState, useEffect } from 'react';
 import { cn } from '@/lib/utils';
+import AndroidInputScrollFix from './android-input-fix';
 
 export default function LayoutWrapper({
   children,
@@ -26,6 +27,7 @@ export default function LayoutWrapper({
         isShowingContent ? 'opacity-100' : 'opacity-0'
       )}
     >
+      <AndroidInputScrollFix />
       {children}
     </div>
   );

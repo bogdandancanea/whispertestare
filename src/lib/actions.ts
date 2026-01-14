@@ -2,12 +2,13 @@
 "use server";
 
 import { db } from './firebase';
-import { doc, getDoc, setDoc, deleteDoc, runTransaction, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, setDoc, deleteDoc, runTransaction, serverTimestamp, updateDoc } from 'firebase/firestore';
 
 export type CardState = {
   sends: number;
   reads: number;
   loaded: boolean;
+  valid: boolean; // Flag to indicate if the card is valid and can be used.
 };
 
 export type EncryptedData = {
@@ -19,6 +20,11 @@ export type EncryptedData = {
 export type WhisperPayload = EncryptedData & {
   expiresAt: number;
   ts: number;
+  status: 'waiting' | 'read';
+  readAt?: {
+    seconds: number;
+    nanoseconds: number;
+  };
 }
 
 export type WhisperData = WhisperPayload & {
@@ -27,9 +33,14 @@ export type WhisperData = WhisperPayload & {
 
 // --- Card Actions ---
 
+const VALID_CARDS = new Set(["card1", "card2", "card3", "card4", "card5", "card6"]);
+
+const invalidState: CardState = { sends: 0, reads: 0, loaded: true, valid: false };
+
 export async function getCardState(cardId: string): Promise<CardState> {
-  if (cardId === 'DEFAULT') {
-    return { sends: 3, reads: 3, loaded: true };
+  // 1. Check if cardId is in the whitelist.
+  if (!VALID_CARDS.has(cardId)) {
+    return invalidState;
   }
   
   const ref = doc(db, 'cards', cardId);
@@ -37,43 +48,33 @@ export async function getCardState(cardId: string): Promise<CardState> {
   try {
     const snap = await getDoc(ref);
 
+    // 2. Check if document exists in Firestore and is active.
     if (snap.exists()) {
       const data = snap.data();
+      if(data.active !== true) {
+        return invalidState;
+      }
       return {
         sends: typeof data.sends === 'number' ? data.sends : 0,
         reads: typeof data.reads === 'number' ? data.reads : 0,
         loaded: true,
+        valid: true,
       };
     } else {
-      // Card doesn't exist, create it.
-      const newCard = {
-        sends: 3,
-        reads: 3,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      await setDoc(ref, newCard);
-      return {
-        sends: newCard.sends,
-        reads: newCard.reads,
-        loaded: true,
-      };
+      // 3. If card is in whitelist but not in DB, it's invalid. DO NOT CREATE IT.
+      return invalidState;
     }
   } catch (error) {
     console.error("Error in getCardState: ", error);
-    // Return a safe, exhausted state in case of DB error
-    return { sends: 0, reads: 0, loaded: true };
+    // Return an invalid state in case of any DB error.
+    return invalidState;
   }
 }
 
 export async function useCard(cardId: string, type: 'send' | 'read'): Promise<CardState | {error: string}> {
-    if (cardId === 'DEFAULT') {
-        // This is a client-side simulation for the demo card.
-        // It doesn't persist, just returns the expected new state.
-        const state = await getCardState(cardId);
-        if (type === 'send') state.sends--;
-        if (type === 'read') state.reads--;
-        return state;
+    // This function should only be called for valid cards, but we double-check.
+    if (!VALID_CARDS.has(cardId)) {
+        return { error: "Invalid card ID provided for transaction." };
     }
 
     const ref = doc(db, 'cards', cardId);
@@ -81,8 +82,8 @@ export async function useCard(cardId: string, type: 'send' | 'read'): Promise<Ca
     try {
         const finalState = await runTransaction(db, async (transaction) => {
             const snap = await transaction.get(ref);
-            if (!snap.exists()) {
-                throw new Error("Card does not exist.");
+            if (!snap.exists() || snap.data().active !== true) {
+                throw new Error("Card does not exist or is inactive.");
             }
 
             const data = snap.data();
@@ -107,6 +108,7 @@ export async function useCard(cardId: string, type: 'send' | 'read'): Promise<Ca
                 sends: type === 'send' ? newFieldValue : currentSends,
                 reads: type === 'read' ? newFieldValue : currentReads,
                 loaded: true,
+                valid: true,
             };
         });
         return finalState;
@@ -123,12 +125,20 @@ export async function useCard(cardId: string, type: 'send' | 'read'): Promise<Ca
 // --- Whisper Actions ---
 
 export async function saveWhisper(id: string, data: EncryptedData): Promise<void> {
-  const payload: WhisperPayload = {
+  const payload: Omit<WhisperPayload, 'readAt'> = {
     ...data,
     expiresAt: Date.now() + 24 * 60 * 60 * 1000, // 24 hours from now
     ts: Date.now(),
+    status: 'waiting',
   }
   await setDoc(doc(db, 'whispers', id), payload);
+}
+
+export async function markAsRead(id: string): Promise<void> {
+  await updateDoc(doc(db, 'whispers', id), {
+    status: 'read',
+    readAt: serverTimestamp(),
+  });
 }
 
 export async function getWhisper(id: string): Promise<WhisperData | null> {

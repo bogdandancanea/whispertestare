@@ -51,7 +51,6 @@ export default {
         'accent-gold': 'hsl(var(--primary))',
         'accent-orange': '#ffab40',
         'accent-red': 'hsl(var(--destructive))',
-        'accent-green': '#00e676',
       },
       borderRadius: {
         lg: 'var(--radius)',

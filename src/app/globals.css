@@ -5,7 +5,7 @@
 @layer base {
   :root {
     --bg-dark: #030305;
-    --bg-card: rgba(12, 12, 18, 0.85); /* 240 20% 6% */
+    --bg-card: rgba(12, 12, 18, 0); /* 240 20% 6% */
     --bg-elevated: rgba(18, 18, 24, 0.9);
     --bg-input: rgba(25, 25, 38, 0.95); /* 240 12% 10% */
 
@@ -14,13 +14,11 @@
     --text-muted: rgba(255, 255, 255, 0.55);
 
     --accent-gold: #e8c547; /* 46 80% 62% */
-    --accent-gold-light: #f5d86e;
     --accent-orange: #ffab40;
     --accent-red: #ff5252; /* 0 100% 66% */
-    --accent-green: #00e676;
 
-    --border: rgba(232, 197, 71, 0.15); /* 46 50% 20% */
-    --border-light: rgba(232, 197, 71, 0.25);
+    --border: rgba(232, 197, 71, 0.25); /* Increased opacity */
+    --border-light: rgba(232, 197, 71, 0.35); /* Increased opacity */
     
     --glow-gold: rgba(232, 197, 71, 0.3);
     
@@ -71,7 +69,7 @@
     --accent-foreground: 46 80% 70%;
     --destructive: 0 100% 66%;
     --destructive-foreground: 0 0% 98%;
-    --border: 46 50% 20%;
+    --border: 46 50% 25%; /* Increased opacity */
     --input: 240 12% 10%;
     --ring: 46 80% 62%;
   }
